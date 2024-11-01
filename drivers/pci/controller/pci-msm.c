@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved. */
+/* Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved. */
 
 #include <dt-bindings/regulator/qcom,rpmh-regulator-levels.h>
 #include <dt-bindings/interconnect/qcom,icc.h>
@@ -107,6 +107,12 @@
 #define PCIE20_PARF_DEBUG_CNT_IN_L1SUB_L1 (0xc84)
 #define PCIE20_PARF_DEBUG_CNT_IN_L1SUB_L2 (0xc88)
 #define PCIE20_PARF_PM_STTS_1 (0x28)
+#define PM_STATE_L0    0
+#define PM_STATE_L0s   1
+#define PM_STATE_L1    2
+#define PM_STATE_L2    3
+#define PCIE_LINK_PM_STATE(val) ((val & (7 << 7)) >> 7)
+#define PCIE_LINK_IN_L2_STATE(val) ((PCIE_LINK_PM_STATE(val)) == PM_STATE_L2)
 #define PCIE20_PARF_L1SS_SLEEP_MODE_HANDLER_STATUS (0x4D0)
 #define PCIE20_PARF_L1SS_SLEEP_MODE_HANDLER_CFG (0x4D4)
 #define PCIE20_PARF_CORE_ERRORS (0x3C0)
@@ -214,6 +220,29 @@
 #define NUM_OF_LANES_SHIFT (8)
 
 #define MSM_PCIE_LTSSM_MASK (0x3f)
+
+/*
+ * Allow selection of clkreq signal with PCIe controller
+ *  1 - PCIe controller receives clk req from cesta
+ *  0 - PCIe controller receives clk req from direct clk req gpio
+ */
+#define PARF_CESTA_CLKREQ_SEL BIT(0)
+
+/* Override bit for sending timeout indication to cesta (debug purpose) */
+#define PARF_CESTA_L1SUB_TIMEOUT_OVERRIDE BIT(1)
+
+/* Override value for sending timeout indication to cesta (debug purpose) */
+#define PARF_CESTA_L1SUB_TIMEOUT_VALUE BIT(2)
+
+/* Enabling the l1ss timeout indication to cesta */
+#define PARF_CESTA_L1SUB_TIMEOUT_EXT_INT_EN BIT(3)
+
+/*
+ * Enabling l1ss timeout indication to internal global int generation.
+ * Legacy method (0 - no global interrupt for l1ss timeout,
+ * 1 - global interrupt for l1ss timeout)
+ */
+#define PARF_LEGACY_L1SUB_TIMEOUT_INT_EN BIT(31)
 
 #define MSM_PCIE_DRV_MAJOR_VERSION (1)
 #define MSM_PCIE_DRV_MINOR_VERSION (0)
@@ -482,6 +511,7 @@ enum msm_pcie_debugfs_option {
 	MSM_PCIE_DISABLE_L1SS,
 	MSM_PCIE_ENABLE_L1SS,
 	MSM_PCIE_ENUMERATION,
+	MSM_PCIE_DEENUMERATION,
 	MSM_PCIE_READ_PCIE_REGISTER,
 	MSM_PCIE_WRITE_PCIE_REGISTER,
 	MSM_PCIE_DUMP_PCIE_REGISTER_SPACE,
@@ -513,6 +543,7 @@ static const char * const
 	"DISABLE L1SS",
 	"ENABLE L1SS",
 	"ENUMERATE",
+	"DE-ENUMERATE",
 	"READ A PCIE REGISTER",
 	"WRITE TO PCIE REGISTER",
 	"DUMP PCIE REGISTER SPACE",
@@ -1093,7 +1124,7 @@ struct msm_pcie_dev_t {
 	bool linkdown_recovery_enable;
 	bool gdsc_clk_drv_ss_nonvotable;
 
-	uint32_t pcie_cesta_clkreq;
+	uint32_t pcie_parf_cesta_config;
 
 	uint32_t rc_idx;
 	uint32_t phy_ver;
@@ -1175,6 +1206,7 @@ struct msm_pcie_dev_t {
 	u32 l1ss_timeout_us;
 	u32 l1ss_sleep_disable;
 	u32 clkreq_gpio;
+	struct pci_host_bridge *bridge;
 };
 
 struct msm_root_dev_t {
@@ -2214,6 +2246,23 @@ static void msm_pcie_sel_debug_testcase(struct msm_pcie_dev_t *dev,
 			else
 				PCIE_DBG_FS(dev,
 					"PCIe: RC%d enumeration failed\n",
+					dev->rc_idx);
+		}
+		break;
+	case MSM_PCIE_DEENUMERATION:
+		PCIE_DBG_FS(dev, "\n\nPCIe: attempting to de enumerate RC%d\n\n",
+			dev->rc_idx);
+		if (!dev->enumerated)
+			PCIE_DBG_FS(dev, "PCIe: RC%d is already de enumerated\n",
+				dev->rc_idx);
+		else {
+			if (!msm_pcie_deenumerate(dev->rc_idx))
+				PCIE_DBG_FS(dev,
+					"PCIe: RC%d is successfully de enumerated\n",
+					dev->rc_idx);
+			else
+				PCIE_DBG_FS(dev,
+					"PCIe: RC%d de enumeration failed\n",
 					dev->rc_idx);
 		}
 		break;
@@ -3903,12 +3952,12 @@ static void msm_pcie_cesta_disable_drv(struct msm_pcie_dev_t *dev)
 	if (!dev->pcie_sm)
 		return;
 
-	msm_pcie_cesta_disable_l1ss_to(dev);
-
 	/* Use CESTA to turn on the resources into D0 state from DRV state*/
 	ret = msm_pcie_cesta_map_apply(dev, D0_STATE);
 	if (ret)
 		PCIE_ERR(dev, "Failed to move to D0 State %d\n", ret);
+
+	msm_pcie_cesta_disable_l1ss_to(dev);
 
 	/* Remove CLKREQ as wake up capable gpio */
 	ret = msm_gpio_mpm_wake_set(dev->clkreq_gpio, false);
@@ -4512,29 +4561,93 @@ static int pcie_phy_init(struct msm_pcie_dev_t *dev)
 	return 0;
 }
 
+static u16 msm_pci_find_ext_capability(struct msm_pcie_dev_t *pci, u8 cap)
+{
+	int pos = PCI_CFG_SPACE_SIZE;
+	u32 header;
+	int ttl;
+
+	/* minimum 8 bytes per capability */
+	ttl = (PCI_CFG_SPACE_EXP_SIZE - PCI_CFG_SPACE_SIZE) / 8;
+
+	header = readl_relaxed(pci->dm_core + pos);
+	/*
+	 * If we have no capabilities, this is indicated by cap ID,
+	 * cap version and next pointer all being 0.
+	 */
+	if (header == 0)
+		return 0;
+
+	while (ttl-- > 0) {
+		if (PCI_EXT_CAP_ID(header) == cap && pos != 0)
+			return pos;
+
+		pos = PCI_EXT_CAP_NEXT(header);
+		if (pos < PCI_CFG_SPACE_SIZE)
+			break;
+
+		header = readl_relaxed(pci->dm_core + pos);
+	}
+
+	return 0;
+}
+
 static void msm_pcie_config_core_preset(struct msm_pcie_dev_t *pcie_dev)
 {
-	u32 supported_link_speed =
-		readl_relaxed(pcie_dev->dm_core + PCIE20_CAP + PCI_EXP_LNKCAP) &
-		PCI_EXP_LNKCAP_SLS;
+	u32 supported_link_speed, supported_link_width;
+	u16 cap_id_offset, offset;
+	u32 val;
+	int i;
+
+	val = readl_relaxed(pcie_dev->dm_core + PCIE20_CAP + PCI_EXP_LNKCAP);
+
+	supported_link_speed = val & PCI_EXP_LNKCAP_SLS;
+	supported_link_width =  (val & PCI_EXP_LNKCAP_MLW) >> PCI_EXP_LNKSTA_NLW_SHIFT;
 
 	/* enable write access to RO register */
-	msm_pcie_write_mask(pcie_dev->dm_core + PCIE_GEN3_MISC_CONTROL, 0,
-				BIT(0));
+	msm_pcie_write_mask(pcie_dev->dm_core + PCIE_GEN3_MISC_CONTROL, 0, BIT(0));
 
 	/* Gen3 */
-	if (supported_link_speed >= PCI_EXP_LNKCAP_SLS_8_0GB)
-		msm_pcie_write_reg(pcie_dev->dm_core, PCIE_GEN3_SPCIE_CAP,
-				pcie_dev->core_preset);
+	if (supported_link_speed >= PCI_EXP_LNKCAP_SLS_8_0GB) {
+		cap_id_offset = msm_pci_find_ext_capability(pcie_dev, PCI_EXT_CAP_ID_SECPCI);
+		if (cap_id_offset == 0)
+			return;
+		/* GEN3 preset is at 0xC offset from Secondary PCI Express Extended Capability ID */
+		offset = cap_id_offset + 0xC;
+		msm_pcie_write_reg(pcie_dev->dm_core, offset, pcie_dev->core_preset);
+		/*
+		 * Each register provides preset hint for 2 lanes.
+		 * If there are more than 2 lanes then programing remaining lanes.
+		 */
+		for (i = 2; i < supported_link_width; i = i+2) {
+			offset += 0x4;
+			msm_pcie_write_reg(pcie_dev->dm_core, offset, pcie_dev->core_preset);
+		}
+	}
 
 	/* Gen4 */
-	if (supported_link_speed >= PCI_EXP_LNKCAP_SLS_16_0GB)
-		msm_pcie_write_reg(pcie_dev->dm_core, PCIE_PL_16GT_CAP +
-				PCI_PL_16GT_LE_CTRL, pcie_dev->core_preset);
+	if (supported_link_speed >= PCI_EXP_LNKCAP_SLS_16_0GB) {
+		cap_id_offset = msm_pci_find_ext_capability(pcie_dev, PCI_EXT_CAP_ID_PL_16GT);
+		if (cap_id_offset == 0)
+			return;
+		/*
+		 * GEN4 preset is at 0x20 offset from Physical Layer
+		 * 16.0 GT/s Extended Capability ID
+		 */
+		offset = cap_id_offset + 0x20;
+		msm_pcie_write_reg(pcie_dev->dm_core, offset, pcie_dev->core_preset);
+		/*
+		 * Each register provides preset hint for 4 lanes.
+		 * If there are more than 4 lanes then programing remaining lanes.
+		 */
+		for (i = 4; i < supported_link_width; i = i+4) {
+			offset += 0x4;
+			msm_pcie_write_reg(pcie_dev->dm_core, offset, pcie_dev->core_preset);
+		}
+	}
 
 	/* disable write access to RO register */
-	msm_pcie_write_mask(pcie_dev->dm_core + PCIE_GEN3_MISC_CONTROL, BIT(0),
-				0);
+	msm_pcie_write_mask(pcie_dev->dm_core + PCIE_GEN3_MISC_CONTROL, BIT(0), 0);
 }
 
 /* Controller settings related to PCIe PHY */
@@ -5597,10 +5710,6 @@ static int msm_pcie_enable_link(struct msm_pcie_dev_t *dev)
 	if (ret)
 		return ret;
 
-	if (dev->pcie_cesta_clkreq)
-		msm_pcie_write_reg_field(dev->parf, dev->pcie_cesta_clkreq,
-								BIT(0), 0);
-
 	/* switch phy aux clock source from xo to phy aux clk */
 	if (dev->phy_aux_clk_mux && dev->phy_aux_clk_ext_src)
 		clk_set_parent(dev->phy_aux_clk_mux, dev->phy_aux_clk_ext_src);
@@ -5703,6 +5812,31 @@ static void msm_pcie_disable_cesta(struct msm_pcie_dev_t *dev)
 	}
 }
 
+static void msm_pcie_parf_cesta_config(struct msm_pcie_dev_t *dev)
+{
+	u32 cesta_config_bits;
+
+	/* Propagate l1ss timeout and clkreq signals to CESTA */
+	if (dev->pcie_sm) {
+
+		cesta_config_bits = PARF_CESTA_CLKREQ_SEL |
+			PARF_CESTA_L1SUB_TIMEOUT_EXT_INT_EN |
+			readl_relaxed(dev->parf + dev->pcie_parf_cesta_config);
+
+		/* Set clkreq to be accessed by CESTA */
+		msm_pcie_write_reg(dev->parf, dev->pcie_parf_cesta_config,
+							cesta_config_bits);
+	} else {
+		/*
+		 * This is currently required only for platforms where clkreq
+		 * signal is routed to CESTA by default, CESTA is not enabled.
+		 */
+		msm_pcie_write_reg_field(dev->parf,
+				dev->pcie_parf_cesta_config,
+					PARF_CESTA_CLKREQ_SEL, 0);
+	}
+}
+
 static int msm_pcie_enable(struct msm_pcie_dev_t *dev)
 {
 	int ret = 0;
@@ -5757,6 +5891,10 @@ static int msm_pcie_enable(struct msm_pcie_dev_t *dev)
 	wmb();
 	if (ret)
 		goto reset_fail;
+
+	/* Configure clkreq, l1ss sleep timeout access to CESTA */
+	if (dev->pcie_parf_cesta_config)
+		msm_pcie_parf_cesta_config(dev);
 
 	/* RUMI PCIe reset sequence */
 	if (dev->rumi_init)
@@ -6020,6 +6158,8 @@ int msm_pcie_enumerate(u32 rc_idx)
 		goto out;
 	}
 
+	dev->cfg_access = true;
+
 	/* kick start ARM PCI configuration framework */
 	ids = readl_relaxed(dev->dm_core);
 	vendor_id = ids & 0xffff;
@@ -6028,16 +6168,26 @@ int msm_pcie_enumerate(u32 rc_idx)
 	PCIE_DBG(dev, "PCIe: RC%d: vendor-id:0x%x device_id:0x%x\n",
 		dev->rc_idx, vendor_id, device_id);
 
-	bridge = devm_pci_alloc_host_bridge(&dev->pdev->dev, sizeof(*dev));
-	if (!bridge) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!dev->bridge) {
+		bridge = devm_pci_alloc_host_bridge(&dev->pdev->dev, sizeof(*dev));
+		if (!bridge) {
 
-	if (!dev->lpi_enable) {
-		ret = msm_msi_init(&dev->pdev->dev);
-		if (ret)
+			PCIE_ERR(dev, "PCIe: RC%d: bridge allocation failed\n", dev->rc_idx);
+			ret = -ENOMEM;
 			goto out;
+		}
+
+		dev->bridge = bridge;
+
+		if (!dev->lpi_enable) {
+			ret = msm_msi_init(&dev->pdev->dev);
+			if (ret)
+				goto out;
+		}
+	} else {
+		bridge = dev->bridge;
+		if (!dev->lpi_enable)
+			msm_msi_config_access(dev_get_msi_domain(&dev->dev->dev), true);
 	}
 
 	bridge->sysdata = dev;
@@ -6087,6 +6237,48 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL(msm_pcie_enumerate);
+
+int msm_pcie_deenumerate(u32 rc_idx)
+{
+	struct msm_pcie_dev_t *dev = &msm_pcie_dev[rc_idx];
+	struct pci_host_bridge *bridge = dev->bridge;
+
+	mutex_lock(&dev->enumerate_lock);
+
+	PCIE_DBG(dev, "RC%d: Entry\n", dev->rc_idx);
+
+	if (!dev->enumerated) {
+		PCIE_DBG(dev, "RC%d:device is not enumerated\n", dev->rc_idx);
+		mutex_unlock(&dev->enumerate_lock);
+		return 0;
+	}
+
+	if (dev->config_recovery) {
+		PCIE_DBG(dev, "RC%d: cancel link_recover_wq\n", dev->rc_idx);
+		cancel_work_sync(&dev->link_recover_wq);
+	}
+
+	spin_lock_irqsave(&dev->cfg_lock, dev->irqsave_flags);
+	dev->cfg_access = false;
+	spin_unlock_irqrestore(&dev->cfg_lock, dev->irqsave_flags);
+
+	pci_stop_root_bus(bridge->bus);
+	pci_remove_root_bus(bridge->bus);
+
+	/* Mask all the interrupts */
+	msm_pcie_write_reg(dev->parf, PCIE20_PARF_INT_ALL_MASK, 0);
+
+	msm_pcie_disable(dev);
+
+	dev->enumerated = false;
+
+	mutex_unlock(&dev->enumerate_lock);
+
+	PCIE_DBG(dev, "RC%d: exit\n", dev->rc_idx);
+	return 0;
+
+}
+EXPORT_SYMBOL_GPL(msm_pcie_deenumerate);
 
 static void msm_pcie_notify_client(struct msm_pcie_dev_t *dev,
 					enum msm_pcie_event event)
@@ -7849,9 +8041,9 @@ static void msm_pcie_read_dt(struct msm_pcie_dev_t *pcie_dev, int rc_idx,
 	}
 
 	ret = of_property_read_u32(of_node, "qcom,pcie-clkreq-offset",
-				&pcie_dev->pcie_cesta_clkreq);
+				&pcie_dev->pcie_parf_cesta_config);
 	if (ret)
-		pcie_dev->pcie_cesta_clkreq = 0;
+		pcie_dev->pcie_parf_cesta_config = 0;
 
 	pcie_dev->config_recovery = of_property_read_bool(of_node,
 							"qcom,config-recovery");
@@ -8572,6 +8764,14 @@ int msm_pcie_set_link_bandwidth(struct pci_dev *pci_dev, u16 target_link_speed,
 	PCIE_DBG(pcie_dev, "PCIe: RC%d: successfully switched link bandwidth\n",
 		pcie_dev->rc_idx);
 out:
+	if (ret) {
+		/* Dump registers incase of the bandwidth switch failure */
+		pcie_parf_dump(pcie_dev);
+		pcie_dm_core_dump(pcie_dev);
+		pcie_phy_dump(pcie_dev);
+		pcie_sm_dump(pcie_dev);
+		pcie_crm_dump(pcie_dev);
+	}
 	msm_pcie_config_l0s_enable_all(pcie_dev);
 	msm_pcie_allow_l1(root_pci_dev);
 
@@ -9111,14 +9311,14 @@ static int msm_pcie_pm_suspend(struct pci_dev *dev,
 	PCIE_DBG(pcie_dev, "RC%d: PME_TURNOFF_MSG is sent out\n",
 		pcie_dev->rc_idx);
 
-	ret_l23 = readl_poll_timeout((pcie_dev->parf
-		+ PCIE20_PARF_PM_STTS), val, (val & BIT(5)), 10000,
-		pcie_dev->l23_rdy_poll_timeout);
+	ret_l23 = readl_poll_timeout((pcie_dev->parf + PCIE20_PARF_PM_STTS_1),
+		val, PCIE_LINK_IN_L2_STATE(val),
+		9000, pcie_dev->l23_rdy_poll_timeout);
 
 	/* check L23_Ready */
-	PCIE_DBG(pcie_dev, "RC%d: PCIE20_PARF_PM_STTS is 0x%x.\n",
+	PCIE_DBG(pcie_dev, "RC%d: PCIE20_PARF_PM_STTS_1 is 0x%x.\n",
 		pcie_dev->rc_idx,
-		readl_relaxed(pcie_dev->parf + PCIE20_PARF_PM_STTS));
+		readl_relaxed(pcie_dev->parf + PCIE20_PARF_PM_STTS_1));
 	if (!ret_l23)
 		PCIE_DBG(pcie_dev, "RC%d: PM_Enter_L23 is received\n",
 			pcie_dev->rc_idx);
@@ -9525,7 +9725,7 @@ static int msm_pcie_drv_suspend(struct msm_pcie_dev_t *pcie_dev,
 	struct msm_pcie_drv_info *drv_info = pcie_dev->drv_info;
 	struct msm_pcie_clk_info_t *clk_info;
 	int ret, i;
-	unsigned long irqsave_flags;
+	unsigned long irqsave_flags, cfg_irqsave_flags;
 	u32 ab = 0, ib = 0;
 
 	/* If CESTA is available then drv is always supported */
@@ -9556,9 +9756,9 @@ static int msm_pcie_drv_suspend(struct msm_pcie_dev_t *pcie_dev,
 	pcie_dev->user_suspend = true;
 	set_bit(pcie_dev->rc_idx, &pcie_drv.rc_drv_enabled);
 	spin_lock_irqsave(&pcie_dev->irq_lock, irqsave_flags);
-	spin_lock_irq(&pcie_dev->cfg_lock);
+	spin_lock_irqsave(&pcie_dev->cfg_lock, cfg_irqsave_flags);
 	pcie_dev->cfg_access = false;
-	spin_unlock_irq(&pcie_dev->cfg_lock);
+	spin_unlock_irqrestore(&pcie_dev->cfg_lock, cfg_irqsave_flags);
 	spin_unlock_irqrestore(&pcie_dev->irq_lock, irqsave_flags);
 	mutex_lock(&pcie_dev->setup_lock);
 	mutex_lock(&pcie_dev->aspm_lock);

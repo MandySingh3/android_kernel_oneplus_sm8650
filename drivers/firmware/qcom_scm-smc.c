@@ -146,7 +146,7 @@ static int scm_smc_do_quirk(struct device *dev, struct arm_smccc_args *smc,
 				continue;
 			} else {
 				fill_wq_wake_ack_args(smc, smc_call_ctx);
-                                scm_waitq_flag_handler(wq, flags);
+				scm_waitq_flag_handler(wq, flags);
 				continue;
 			}
 		} else if ((long)res->a0 < 0) {
@@ -154,7 +154,7 @@ static int scm_smc_do_quirk(struct device *dev, struct arm_smccc_args *smc,
 			*smc = original;
 			break;
 		} else
-                    return 0;
+			return 0;
 	} while (IS_WAITQ_SLEEP_OR_WAKE(res));
 
 	return 0;
@@ -175,12 +175,12 @@ static int __scm_smc_do(struct device *dev, struct arm_smccc_args *smc,
 
 	do {
 		if (!multi_smc_call)
-                    mutex_lock(&qcom_scm_lock);
-                down(&qcom_scm_sem_lock);
-                ret = scm_smc_do_quirk(dev, smc, res);
-                up(&qcom_scm_sem_lock);
-                if (!multi_smc_call)
-                    mutex_unlock(&qcom_scm_lock);
+			mutex_lock(&qcom_scm_lock);
+		down(&qcom_scm_sem_lock);
+		ret = scm_smc_do_quirk(dev, smc, res);
+		up(&qcom_scm_sem_lock);
+		if (!multi_smc_call)
+			mutex_unlock(&qcom_scm_lock);
 		if (ret)
 			return ret;
 

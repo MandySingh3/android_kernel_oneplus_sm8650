@@ -1466,10 +1466,6 @@ static int _anx7625_hpd_polling(struct anx7625_data *ctx,
 	int ret, val;
 	struct device *dev = &ctx->client->dev;
 
-	/* Interrupt mode, no need poll HPD status, just return */
-	if ((ctx->pdata.intp_irq) && !(ctx->out_of_hibr))
-		return 0;
-
 	ret = readx_poll_timeout(anx7625_read_hpd_status_p0,
 				 ctx, val,
 				 ((val & HPD_STATUS) || (val < 0)),
@@ -1487,9 +1483,6 @@ static int _anx7625_hpd_polling(struct anx7625_data *ctx,
 			  INTERFACE_CHANGE_INT, 0);
 
 	anx7625_start_dp_work(ctx);
-
-	if (!ctx->pdata.panel_bridge && ctx->bridge_attached)
-		drm_helper_hpd_irq_event(ctx->bridge.dev);
 
 	return 0;
 }
@@ -1605,9 +1598,6 @@ static void anx7625_work_func(struct work_struct *work)
 	event = anx7625_hpd_change_detect(ctx);
 	if (event < 0)
 		goto unlock;
-
-	if (ctx->bridge_attached)
-		drm_helper_hpd_irq_event(ctx->bridge.dev);
 
 unlock:
 	mutex_unlock(&ctx->lock);
@@ -2199,6 +2189,14 @@ static int anx7625_bridge_attach(struct drm_bridge *bridge,
 	}
 
 	if (!ctx->pdata.is_dpi) {
+		err  = anx7625_setup_dsi_device(ctx);
+		if (err) {
+			DRM_DEV_ERROR(dev, "Fail to attach to dsi : %d\n", err);
+			return err;
+		}
+	}
+
+	if (!ctx->pdata.is_dpi) {
 		err  = anx7625_attach_dsi(ctx);
 		if (err) {
 			DRM_DEV_ERROR(dev, "Fail to attach to dsi : %d\n", err);
@@ -2216,7 +2214,7 @@ static int anx7625_bridge_attach(struct drm_bridge *bridge,
 		}
 	}
 
-	device_link_add(bridge->dev->dev, dev, DL_FLAG_PM_RUNTIME);
+	device_link_add(bridge->dev->dev, dev, DL_FLAG_STATELESS);
 	ctx->bridge_attached = 1;
 
 	return 0;
@@ -2654,12 +2652,6 @@ static int anx7625_link_bridge(struct drm_dp_aux *aux)
 
 	drm_bridge_add(&platform->bridge);
 
-	if (!platform->pdata.is_dpi) {
-		ret = anx7625_attach_dsi(platform);
-		if (ret)
-			drm_bridge_remove(&platform->bridge);
-	}
-
 	return ret;
 }
 
@@ -2747,11 +2739,6 @@ static int anx7625_i2c_probe(struct i2c_client *client)
 		goto free_wq;
 	}
 
-	if (!platform->pdata.is_dpi) {
-		ret = anx7625_setup_dsi_device(platform);
-		if (ret < 0)
-			goto free_wq;
-	}
 
 	/*
 	 * Registering the i2c devices will retrigger deferred probe, so it
@@ -2783,10 +2770,6 @@ static int anx7625_i2c_probe(struct i2c_client *client)
 			DRM_DEV_ERROR(dev, "failed to populate aux bus : %d\n", ret);
 			goto free_wq;
 		}
-
-		ret = anx7625_link_bridge(&platform->aux);
-		if (ret)
-			goto free_wq;
 	}
 
 	if (!platform->pdata.low_power_mode) {
@@ -2799,6 +2782,9 @@ static int anx7625_i2c_probe(struct i2c_client *client)
 	if (platform->pdata.intp_irq)
 		queue_work(platform->workqueue, &platform->work);
 
+	ret = anx7625_link_bridge(&platform->aux);
+	if (ret)
+		goto free_wq;
 
 	if (platform->pdata.audio_en)
 		anx7625_register_audio(dev, platform);

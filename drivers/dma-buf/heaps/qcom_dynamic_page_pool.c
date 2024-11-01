@@ -22,17 +22,9 @@
 #include <uapi/linux/sched/types.h>
 
 #include "qcom_dynamic_page_pool.h"
-#if IS_ENABLED(CONFIG_CONT_PTE_HUGEPAGE)
-#include "../../../mm/chp_ext.h"
-#endif
 
 static LIST_HEAD(pool_list);
 static DEFINE_MUTEX(pool_list_lock);
-
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
-atomic64_t qcom_dma_heap_pool = ATOMIC64_INIT(0);
-EXPORT_SYMBOL(qcom_dma_heap_pool);
-#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
 
 void dynamic_page_pool_add(struct dynamic_page_pool *pool, struct page *page)
 {
@@ -50,9 +42,6 @@ void dynamic_page_pool_add(struct dynamic_page_pool *pool, struct page *page)
 	atomic_inc(&pool->count);
 	mod_node_page_state(page_pgdat(page), NR_KERNEL_MISC_RECLAIMABLE,
 			    1 << pool->order);
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
-	atomic64_add(1 << pool->order, &qcom_dma_heap_pool);
-#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
 	spin_unlock_irqrestore(&pool->lock, flags);
 }
 
@@ -72,9 +61,6 @@ struct page *dynamic_page_pool_remove(struct dynamic_page_pool *pool, bool high)
 
 	atomic_dec(&pool->count);
 	list_del(&page->lru);
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
-	atomic64_sub(1 << pool->order, &qcom_dma_heap_pool);
-#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
 	mod_node_page_state(page_pgdat(page), NR_KERNEL_MISC_RECLAIMABLE,
 			    -(1 << pool->order));
 	return page;
@@ -156,11 +142,7 @@ void dynamic_page_pool_destroy(struct dynamic_page_pool *pool)
 
 	list_for_each_entry_safe(page, tmp, &pages, lru) {
 		list_del(&page->lru);
-#if IS_ENABLED(CONFIG_CONT_PTE_HUGEPAGE)
-		__free_pages_ext(page, pool->order);
-#else
 		__free_pages(page, pool->order);
-#endif
 	}
 
 	kfree(pool);
@@ -210,11 +192,7 @@ static int dynamic_page_pool_do_shrink(struct dynamic_page_pool *pool, gfp_t gfp
 
 	list_for_each_entry_safe(page, tmp, &pages, lru) {
 		list_del(&page->lru);
-#if IS_ENABLED(CONFIG_CONT_PTE_HUGEPAGE)
-		__free_pages_ext(page, pool->order);
-#else
 		__free_pages(page, pool->order);
-#endif
 	}
 
 	return freed;

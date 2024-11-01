@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
@@ -8,19 +8,6 @@
 #include <trace/hooks/sched.h>
 #include <walt.h>
 #include "trace.h"
-
-#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
-#include <../kernel/oplus_cpu/sched/frame_boost/frame_group.h>
-#endif
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_SCHED_ASSIST)
-#include <../kernel/oplus_cpu/sched/sched_assist/sa_fair.h>
-#endif
-#endif /* CONFIG_OPLUS_ADD_CORE_CTRL_MASK */
-
-#ifdef CONFIG_OPLUS_BENCHMARK_CPU
-#include "benchmark_test.h"
-#endif
 
 #ifdef CONFIG_HOTPLUG_CPU
 
@@ -301,7 +288,7 @@ void restrict_cpus_and_freq(struct cpumask *cpus)
 		}
 	}
 
-	update_fmax_cap_capacities(PARTIAL_HALT_CAP);
+	update_fmax_cap_capacities();
 }
 
 struct task_struct *walt_drain_thread;
@@ -508,17 +495,36 @@ int walt_partial_resume_cpus(struct cpumask *cpus, enum pause_client client)
 }
 EXPORT_SYMBOL_GPL(walt_partial_resume_cpus);
 
-/* return true if the requested client has fully halted one of the cpus */
+/**
+ * cpus_halted_by_client: determine if client has halted a cpu
+ *   where all cpus in the mask are halted.
+ *
+ * If all cpus in the cluster are halted, and one of them is
+ * halted for this client, then and only then indicate pass.
+ *
+ * Otherwise, if not all cpus are halted, or none of the cpus
+ * are halted by this particular client, then reject.
+ *
+ * return true if conditions are met, false otherwise.
+ */
 bool cpus_halted_by_client(struct cpumask *cpus, enum pause_client client)
 {
 	struct halt_cpu_state *halt_cpu_state;
+	bool cpu_halted_for_client = false;
 	int cpu;
 
 	for_each_cpu(cpu, cpus) {
 		halt_cpu_state = per_cpu_ptr(&halt_state, cpu);
-		if ((bool)(halt_cpu_state->client_vote_mask[HALT] & client))
-			return true;
+
+		if (!halt_cpu_state->client_vote_mask[HALT])
+			return false;
+
+		if (halt_cpu_state->client_vote_mask[HALT] & client)
+			cpu_halted_for_client = true;
 	}
+
+	if (cpu_halted_for_client)
+		return true;
 
 	return false;
 }
@@ -535,6 +541,28 @@ static void android_rvh_get_nohz_timer_target(void *unused, int *cpu, bool *done
 		if (!available_idle_cpu(*cpu))
 			return;
 		default_cpu = *cpu;
+	}
+
+	/*
+	 * find first cpu halted by core control and try to avoid
+	 * affecting externally halted cpus.
+	 */
+	if (!cpumask_andnot(&unhalted, cpu_active_mask, cpu_halt_mask)) {
+		cpumask_t tmp_pause, tmp_part_pause, tmp_halt, *tmp;
+
+		cpumask_and(&tmp_part_pause, cpu_active_mask, &cpus_part_paused_by_us);
+		cpumask_and(&tmp_pause, cpu_active_mask, &cpus_paused_by_us);
+		cpumask_and(&tmp_halt, cpu_active_mask, cpu_halt_mask);
+		tmp = cpumask_weight(&tmp_part_pause) ? &tmp_part_pause :
+			cpumask_weight(&tmp_pause) ? &tmp_pause : &tmp_halt;
+
+		for_each_cpu(i, tmp) {
+			if ((*cpu == i) && cpumask_weight(tmp) > 1)
+				continue;
+
+			*cpu = i;
+			return;
+		}
 	}
 
 	rcu_read_lock();
@@ -592,11 +620,6 @@ static void android_rvh_set_cpus_allowed_by_task(void *unused,
 {
 	if (unlikely(walt_disabled))
 		return;
-
-#ifdef CONFIG_OPLUS_BENCHMARK_CPU
-	if (bm_set_cpus_allowed_by_task(cpu_valid_mask, new_mask, p, dest_cpu))
-		return;
-#endif
 
 	/* allow kthreads to change affinity regardless of halt status of dest_cpu */
 	if (p->flags & PF_KTHREAD)
@@ -685,10 +708,6 @@ static void android_rvh_is_cpu_allowed(void *unused, struct task_struct *p, int 
 			*allowed = true;
 		}
 	}
-#ifdef CONFIG_OPLUS_BENCHMARK_CPU
-	if (test_benchmark_task(p))
-		*allowed = true;
-#endif
 }
 
 void walt_halt_init(void)
@@ -702,16 +721,6 @@ void walt_halt_init(void)
 	}
 
 	sched_setscheduler_nocheck(walt_drain_thread, SCHED_FIFO, &param);
-
-#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_FRAME_BOOST)
-	init_fbg_halt_mask(&__cpu_halt_mask);
-#endif
-
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_SCHED_ASSIST)
-	init_ux_halt_mask(&__cpu_halt_mask);
-#endif
-#endif /* CONFIG_OPLUS_ADD_CORE_CTRL_MASK */
 
 	register_trace_android_rvh_get_nohz_timer_target(android_rvh_get_nohz_timer_target, NULL);
 	register_trace_android_rvh_set_cpus_allowed_by_task(
